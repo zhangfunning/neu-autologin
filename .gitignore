@@ -1,0 +1,28 @@
+# Build outputs
+publish/
+NEUNetworkAutoLogin.exe
+*.exe
+*.dll
+*.pdb
+*.xml
+*.deps.json
+*.runtimeconfig.json
+
+# .NET intermediates
+NEUNetworkAutoLogin.Wpf/bin/
+NEUNetworkAutoLogin.Wpf/obj/
+
+# Node dependencies
+bin/node_modules/
+
+# Local runtime data (may contain sensitive info)
+config/
+logs/
+
+# IDE/cache
+.vs/
+.vscode/
+*.user
+*.suo
+*.tmp
+*.cache
