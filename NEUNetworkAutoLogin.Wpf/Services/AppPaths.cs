@@ -14,8 +14,6 @@ public sealed class AppPaths
         StartupShortcutPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.Startup),
             "NEUNetworkAutoLogin.lnk");
-        HelpersDirectory = Path.Combine(BaseDirectory, "bin");
-        PortalHelperScriptPath = Path.Combine(HelpersDirectory, "portal-sso-login.js");
     }
 
     public string BaseDirectory { get; }
@@ -23,6 +21,4 @@ public sealed class AppPaths
     public string SettingsPath { get; }
     public string CredentialPath { get; }
     public string StartupShortcutPath { get; }
-    public string HelpersDirectory { get; }
-    public string PortalHelperScriptPath { get; }
 }

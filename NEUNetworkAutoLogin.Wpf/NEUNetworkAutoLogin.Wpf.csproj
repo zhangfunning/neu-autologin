@@ -18,10 +18,4 @@
     </Content>
   </ItemGroup>
 
-  <ItemGroup>
-    <EmbeddedResource Include="..\bin\portal-sso-login.js">
-      <Link>Resources\portal-sso-login.js</Link>
-      <LogicalName>NEUNetworkAutoLogin.Resources.portal-sso-login.js</LogicalName>
-    </EmbeddedResource>
-  </ItemGroup>
 </Project>

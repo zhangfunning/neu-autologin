@@ -26,7 +26,7 @@
 - `NEUNetworkAutoLogin.Wpf/`：WPF 源码
 - `build-gui-exe.ps1`：打包脚本
 - `NEUNetworkAutoLogin.exe`：当前生成的可执行文件
-- `bin/portal-sso-login.js`：登录/注销浏览器辅助脚本（运行时需要）
+- 认证链路：当前版本已改为纯 `HttpClient`，不再依赖 Node/Playwright 脚本
 
 ## 运行
 

@@ -14,7 +14,6 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectPath = Join-Path $scriptRoot "NEUNetworkAutoLogin.Wpf\NEUNetworkAutoLogin.Wpf.csproj"
 $publishDir = Join-Path $scriptRoot "publish"
 $outputExe = Join-Path $scriptRoot "NEUNetworkAutoLogin.exe"
-$browserHelperDir = Join-Path $scriptRoot "bin"
 
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     throw "dotnet CLI is not installed. Install .NET 8 SDK first."
@@ -59,10 +58,6 @@ if (-not (Test-Path -LiteralPath $publishedExe)) {
 }
 
 Copy-Item -LiteralPath $publishedExe -Destination $outputExe -Force
-
-if (Test-Path -LiteralPath $browserHelperDir) {
-    Copy-Item -LiteralPath $browserHelperDir -Destination (Join-Path $publishDir "bin") -Recurse -Force
-}
 
 Write-Output "Built single-file EXE ($DeploymentMode):"
 Write-Output $outputExe
