@@ -34,7 +34,27 @@ public partial class App : System.Windows.Application
     {
         try
         {
-            await Services.MonitorService.StartAsync(cancellationToken);
+            var settings = Services.SettingsStore.Load();
+            if (!settings.EnableBackgroundMonitor)
+            {
+                Services.Logger.Log("Background startup skipped because monitor option is disabled.");
+                Shutdown();
+                return;
+            }
+
+            var startResult = await Services.MonitorService.StartAsync(cancellationToken);
+            if (startResult == MonitorService.StartResult.AlreadyRunningInAnotherProcess)
+            {
+                Services.Logger.Log("Background startup skipped because monitor is already running.");
+                Shutdown();
+                return;
+            }
+            if (startResult == MonitorService.StartResult.DisabledBySettings)
+            {
+                Services.Logger.Log("Background startup skipped because monitor option is disabled.");
+                Shutdown();
+                return;
+            }
         }
         catch (Exception ex)
         {
@@ -70,7 +90,7 @@ public partial class App : System.Windows.Application
 
         try
         {
-            Services.Logger.ClearLogs();
+            Services.Logger.CleanupOldLogs(keepDays: 14);
         }
         catch
         {

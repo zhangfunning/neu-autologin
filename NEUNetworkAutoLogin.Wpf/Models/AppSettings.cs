@@ -5,6 +5,7 @@ public sealed class AppSettings
     public int AcId { get; set; } = 16;
     public string PortalHost { get; set; } = "https://ipgw.neu.edu.cn/";
     public string ServiceBaseUrl { get; set; } = "https://ipgw.neu.edu.cn/srun_portal_sso";
+    public bool EnableBackgroundMonitor { get; set; } = true;
 
     public int InitialDelaySeconds { get; set; } = 20;
     public int RetryDelaySeconds { get; set; } = 15;

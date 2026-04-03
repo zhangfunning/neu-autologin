@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
 using NEUNetworkAutoLogin.Models;
@@ -15,6 +16,8 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _refreshTimer;
     private readonly Forms.NotifyIcon _notifyIcon;
     private bool _allowExit;
+    private bool _isLoadingUiModel;
+    private int _monitorEnsureInProgress;
     private string _lastLogSnapshot = string.Empty;
 
     public MainWindow()
@@ -37,29 +40,32 @@ public partial class MainWindow : Window
 
     private void LoadUiModel()
     {
-        var settings = _services.SettingsStore.Load();
-        var credential = _services.CredentialStore.Load();
+        _isLoadingUiModel = true;
+        try
+        {
+            var settings = _services.SettingsStore.Load();
+            var credential = _services.CredentialStore.Load();
 
-        UsernameBox.Text = credential.Username;
-        PasswordBox.Password = credential.Password;
-        PortalHostBox.Text = settings.PortalHost;
-        ServiceBaseUrlBox.Text = settings.ServiceBaseUrl;
-        AcIdBox.Text = settings.AcId.ToString();
-        StartupCheckBox.IsChecked = _services.StartupManager.IsEnabled();
+            UsernameBox.Text = credential.Username;
+            PasswordBox.Password = credential.Password;
+            PortalHostBox.Text = settings.PortalHost;
+            ServiceBaseUrlBox.Text = settings.ServiceBaseUrl;
+            MonitorEnabledCheckBox.IsChecked = settings.EnableBackgroundMonitor;
+            StartupCheckBox.IsChecked = _services.StartupManager.IsEnabled();
+        }
+        finally
+        {
+            _isLoadingUiModel = false;
+        }
     }
 
     private AppSettings CollectSettingsFromUi(bool requireCredential)
     {
-        if (!int.TryParse(AcIdBox.Text.Trim(), out var acId) || acId <= 0)
-        {
-            throw new InvalidOperationException("AC ID 必须是大于 0 的整数。");
-        }
-
         var portalHost = PortalHostBox.Text.Trim();
         var serviceBaseUrl = ServiceBaseUrlBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(portalHost) || string.IsNullOrWhiteSpace(serviceBaseUrl))
         {
-            throw new InvalidOperationException("Portal Host 与 Service Base URL 不能为空。");
+            throw new InvalidOperationException("Portal Host 和 Service Base URL 不能为空。");
         }
 
         if (requireCredential &&
@@ -69,9 +75,9 @@ public partial class MainWindow : Window
         }
 
         var current = _services.SettingsStore.Load();
-        current.AcId = acId;
         current.PortalHost = portalHost;
         current.ServiceBaseUrl = serviceBaseUrl;
+        current.EnableBackgroundMonitor = MonitorEnabledCheckBox.IsChecked == true;
         return current;
     }
 
@@ -90,15 +96,50 @@ public partial class MainWindow : Window
         _services.SettingsStore.Save(settings);
         _services.StartupManager.SetEnabled(StartupCheckBox.IsChecked == true);
 
-        var hasCredential = !string.IsNullOrWhiteSpace(UsernameBox.Text) && !string.IsNullOrWhiteSpace(PasswordBox.Password);
+        var hasCredential = !string.IsNullOrWhiteSpace(UsernameBox.Text) &&
+                            !string.IsNullOrWhiteSpace(PasswordBox.Password);
         if (requireCredential || hasCredential)
         {
-            var credential = CollectCredentialFromUi();
-            _services.CredentialStore.Save(credential);
+            _services.CredentialStore.Save(CollectCredentialFromUi());
+        }
+
+        if (!settings.EnableBackgroundMonitor && _services.MonitorService.IsRunning)
+        {
+            await _services.MonitorService.StopAsync();
+            _services.Logger.Log("后台监控已关闭，已自动停止当前监控实例。");
         }
 
         _services.Logger.Log("配置已保存。");
-        await Task.CompletedTask;
+    }
+
+    private async Task ApplyMonitorSwitchAsync()
+    {
+        var settings = _services.SettingsStore.Load();
+        var enableMonitor = MonitorEnabledCheckBox.IsChecked == true;
+        settings.EnableBackgroundMonitor = enableMonitor;
+        _services.SettingsStore.Save(settings);
+
+        if (enableMonitor)
+        {
+            var startResult = await _services.MonitorService.StartAsync();
+            if (startResult == MonitorService.StartResult.AlreadyRunningInAnotherProcess)
+            {
+                _services.Logger.Log("后台监控已由另一个进程运行。");
+                return;
+            }
+
+            if (startResult == MonitorService.StartResult.DisabledBySettings)
+            {
+                _services.Logger.Log("后台监控启用失败：配置未启用。");
+                return;
+            }
+
+            _services.Logger.Log("后台监控已开启。");
+            return;
+        }
+
+        await _services.MonitorService.StopAsync();
+        _services.Logger.Log("后台监控已关闭。");
     }
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
@@ -118,16 +159,30 @@ public partial class MainWindow : Window
             await SaveFromUiAsync(requireCredential: true);
             var settings = _services.SettingsStore.Load();
             var credential = _services.CredentialStore.Load();
-            var result = await _services.PortalLoginClient.LoginAsync(settings, credential, CancellationToken.None);
+            var context = await _services.ProbeService.ResolvePortalContextAsync(settings, CancellationToken.None);
+            var effective = new AppSettings
+            {
+                AcId = context.AcId > 0 ? context.AcId : settings.AcId,
+                PortalHost = string.IsNullOrWhiteSpace(context.PortalHost) ? settings.PortalHost : context.PortalHost,
+                ServiceBaseUrl = settings.ServiceBaseUrl,
+                EnableBackgroundMonitor = settings.EnableBackgroundMonitor,
+                InitialDelaySeconds = settings.InitialDelaySeconds,
+                RetryDelaySeconds = settings.RetryDelaySeconds,
+                MaxAttempts = settings.MaxAttempts,
+                MonitorIntervalSeconds = settings.MonitorIntervalSeconds,
+                FailureCooldownMinutes = settings.FailureCooldownMinutes,
+                HealthCheckTimeoutSeconds = settings.HealthCheckTimeoutSeconds
+            };
+
+            _services.Logger.Log($"Manual login context: ac_id={effective.AcId}, portal={effective.PortalHost}");
+            var result = await _services.PortalLoginClient.LoginAsync(effective, credential, CancellationToken.None, context.IsWireless);
             _services.Logger.Log($"手动登录 => success={result.Success}, finalUrl={result.FinalUrl}, message={result.Message}");
             if (result.Trace.Count > 0)
             {
                 _services.Logger.Log($"手动登录 trace => {string.Join(" | ", result.Trace)}");
             }
 
-            SetStatus(result.Success
-                ? $"登录成功：{result.Message}"
-                : $"登录失败：{result.Message}");
+            SetStatus(result.Success ? $"登录成功：{result.Message}" : $"登录失败：{result.Message}");
             RefreshUi();
         }, disableUi: false);
     }
@@ -137,10 +192,29 @@ public partial class MainWindow : Window
         await ExecuteGuardedAsync(async () =>
         {
             await SaveFromUiAsync(requireCredential: false);
+
             if (_services.MonitorService.IsRunning)
             {
                 await _services.MonitorService.StopAsync();
                 _services.Logger.Log("手动注销前已暂停后台监控。");
+            }
+
+            if (MonitorEnabledCheckBox.IsChecked == true)
+            {
+                _isLoadingUiModel = true;
+                try
+                {
+                    MonitorEnabledCheckBox.IsChecked = false;
+                }
+                finally
+                {
+                    _isLoadingUiModel = false;
+                }
+
+                var updated = _services.SettingsStore.Load();
+                updated.EnableBackgroundMonitor = false;
+                _services.SettingsStore.Save(updated);
+                _services.Logger.Log("手动注销后已自动取消后台监控勾选。");
             }
 
             var settings = _services.SettingsStore.Load();
@@ -152,37 +226,61 @@ public partial class MainWindow : Window
             }
 
             SetStatus(result.Success
-                ? $"注销成功：{result.Message}（后台监控已暂停）"
-                : $"注销失败：{result.Message}（后台监控已暂停）");
+                ? $"注销成功：{result.Message}（后台监控已关闭）"
+                : $"注销失败：{result.Message}（后台监控已关闭）");
             RefreshUi();
         }, disableUi: false);
     }
 
-    private async void StartButton_Click(object sender, RoutedEventArgs e)
+    private async void MonitorEnabledCheckBox_CheckedChanged(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingUiModel)
+        {
+            return;
+        }
+
         await ExecuteGuardedAsync(async () =>
         {
-            await SaveFromUiAsync(requireCredential: false);
-            await _services.MonitorService.StartAsync();
-            SetStatus("监控已启动。");
+            await ApplyMonitorSwitchAsync();
             RefreshUi();
-        });
+        }, disableUi: false);
     }
 
-    private async void StopButton_Click(object sender, RoutedEventArgs e)
+    private async void StartupCheckBox_CheckedChanged(object sender, RoutedEventArgs e)
     {
-        await ExecuteGuardedAsync(async () =>
+        if (_isLoadingUiModel)
         {
-            await _services.MonitorService.StopAsync();
-            SetStatus("监控已停止。");
+            return;
+        }
+
+        await ExecuteGuardedAsync(() =>
+        {
+            var enabled = StartupCheckBox.IsChecked == true;
+            _services.StartupManager.SetEnabled(enabled);
+            _services.Logger.Log(enabled ? "开机自启动已开启。" : "开机自启动已关闭。");
             RefreshUi();
-        });
+            return Task.CompletedTask;
+        }, disableUi: false);
     }
 
     private void OpenLogsButton_Click(object sender, RoutedEventArgs e)
     {
         var path = _services.Logger.OpenLogsDirectory();
         Process.Start(new ProcessStartInfo("explorer.exe", path) { UseShellExecute = true });
+    }
+
+    private async void ClearLogsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ExecuteGuardedAsync(() =>
+        {
+            var removed = _services.Logger.ClearAllLogs();
+            _lastLogSnapshot = string.Empty;
+            LogTextBox.Clear();
+            _services.Logger.Log($"日志已手动清空，删除文件数: {removed}.");
+            SetStatus("日志已清空。");
+            RefreshUi();
+            return Task.CompletedTask;
+        }, disableUi: false);
     }
 
     private void MinimizeButton_Click(object sender, RoutedEventArgs e)
@@ -236,8 +334,22 @@ public partial class MainWindow : Window
 
     private void RefreshUi()
     {
+        var settings = _services.SettingsStore.Load();
+        if (settings.EnableBackgroundMonitor &&
+            !_services.MonitorService.IsRunning &&
+            !_services.MonitorService.IsRunningInAnotherProcess)
+        {
+            _ = EnsureMonitorRunningAsync();
+        }
+
         var startup = _services.StartupManager.IsEnabled() ? "开机自启：已开启" : "开机自启：未开启";
-        var monitor = _services.MonitorService.IsRunning ? "后台监控：运行中" : "后台监控：未运行";
+        var monitor = !settings.EnableBackgroundMonitor
+            ? "后台监控：已禁用"
+            : _services.MonitorService.IsRunning
+                ? "后台监控：运行中"
+                : _services.MonitorService.IsRunningInAnotherProcess
+                    ? "后台监控：已由后台实例运行"
+                    : "后台监控：已启用（等待启动）";
         SetStatus($"{startup} | {monitor}");
 
         var logText = _services.Logger.ReadTail();
@@ -295,6 +407,7 @@ public partial class MainWindow : Window
             {
                 ToggleUi(false);
             }
+
             await action();
         }
         catch (Exception ex)
@@ -337,9 +450,35 @@ public partial class MainWindow : Window
         SaveButton.IsEnabled = enabled;
         LoginButton.IsEnabled = enabled;
         LogoutButton.IsEnabled = enabled;
-        StartButton.IsEnabled = enabled;
-        StopButton.IsEnabled = enabled;
         OpenLogsButton.IsEnabled = enabled;
+        ClearLogsButton.IsEnabled = enabled;
         MinimizeButton.IsEnabled = enabled;
+        MonitorEnabledCheckBox.IsEnabled = enabled;
+        StartupCheckBox.IsEnabled = enabled;
+    }
+
+    private async Task EnsureMonitorRunningAsync()
+    {
+        if (Interlocked.CompareExchange(ref _monitorEnsureInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var startResult = await _services.MonitorService.StartAsync();
+            if (startResult == MonitorService.StartResult.Started)
+            {
+                _services.Logger.Log("后台监控自动补启动成功。");
+            }
+        }
+        catch (Exception ex)
+        {
+            _services.Logger.Log($"后台监控自动补启动失败: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _monitorEnsureInProgress, 0);
+        }
     }
 }

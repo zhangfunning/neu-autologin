@@ -47,8 +47,14 @@ public sealed class AppLogger
         return _paths.LogsDirectory;
     }
 
-    public void ClearLogs()
+    public void CleanupOldLogs(int keepDays = 7)
     {
+        if (keepDays < 1)
+        {
+            keepDays = 1;
+        }
+
+        var cutoff = DateTime.Now.Date.AddDays(-keepDays);
         lock (_sync)
         {
             if (!Directory.Exists(_paths.LogsDirectory))
@@ -60,13 +66,44 @@ public sealed class AppLogger
             {
                 try
                 {
-                    File.Delete(file);
+                    var lastWrite = File.GetLastWriteTime(file);
+                    if (lastWrite < cutoff)
+                    {
+                        File.Delete(file);
+                    }
                 }
                 catch
                 {
                     // best effort cleanup on exit
                 }
             }
+        }
+    }
+
+    public int ClearAllLogs()
+    {
+        lock (_sync)
+        {
+            if (!Directory.Exists(_paths.LogsDirectory))
+            {
+                return 0;
+            }
+
+            var removed = 0;
+            foreach (var file in Directory.EnumerateFiles(_paths.LogsDirectory, "autologin-*.log"))
+            {
+                try
+                {
+                    File.Delete(file);
+                    removed++;
+                }
+                catch
+                {
+                    // ignore single file deletion failures and continue.
+                }
+            }
+
+            return removed;
         }
     }
 

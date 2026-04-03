@@ -21,6 +21,12 @@ public sealed class PortalLoginClient
         "id=['\"](?:errormsghide|errormsg)['\"][^>]*>(?<msg>[^<]+)<",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex IPv4Regex = new(@"^\d{1,3}(?:\.\d{1,3}){3}$", RegexOptions.Compiled);
+    private static readonly Regex ActivateUrlRegex = new(
+        @"(?<url>(?:https?:)?//[^'""\s<>]*srun_portal_sso[^'""\s<>]*|/[^'""\s<>]*srun_portal_sso[^'""\s<>]*)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ConnectUrlRegex = new(
+        @"(?<url>(?:https?:)?//[^'""\s<>]*(?:v1/srun_portal_sso|srun_portal_sso)[^'""\s<>]*|/[^'""\s<>]*(?:v1/srun_portal_sso|srun_portal_sso)[^'""\s<>]*)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public PortalLoginClient(AppPaths _)
     {
@@ -29,7 +35,8 @@ public sealed class PortalLoginClient
     public async Task<PortalLoginResult> LoginAsync(
         AppSettings settings,
         CredentialModel credential,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isWireless = false)
     {
         if (string.IsNullOrWhiteSpace(credential.Username) || string.IsNullOrWhiteSpace(credential.Password))
         {
@@ -41,7 +48,9 @@ public sealed class PortalLoginClient
         }
 
         var trace = new List<string>();
-        var urls = BuildUrls(settings);
+        var urls = BuildUrls(settings, isWireless);
+        trace.Add($"service-url {urls.ServiceUrl}");
+        trace.Add(isWireless ? "auth-mode wireless-legacy" : "auth-mode wired-unified");
 
         using var handler = CreateHandler();
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(45) };
@@ -110,7 +119,11 @@ public sealed class PortalLoginClient
                 cancellationToken);
             trace.Add($"after-submit {finalAfterPost}");
 
-            await ActivateTicketIfPresentAsync(client, finalAfterPost, settings.AcId, trace, cancellationToken);
+            var activated = await ActivateTicketIfPresentAsync(client, urls, finalAfterPost, settings.AcId, trace, cancellationToken, isWireless);
+            if (!isWireless && !activated)
+            {
+                await TryPortalConnectStepAsync(client, urls, settings.AcId, trace, cancellationToken);
+            }
 
             for (var i = 0; i < 8; i++)
             {
@@ -162,7 +175,7 @@ public sealed class PortalLoginClient
     public async Task<PortalLoginResult> LogoutAsync(AppSettings settings, CancellationToken cancellationToken)
     {
         var trace = new List<string>();
-        var urls = BuildUrls(settings);
+        var urls = BuildUrls(settings, isWireless: false);
 
         using var handler = CreateHandler();
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(40) };
@@ -325,6 +338,7 @@ public sealed class PortalLoginClient
         CancellationToken cancellationToken)
     {
         var current = requestUrl;
+        var previous = requestUrl;
         if (!IsRedirect(initialResponse.StatusCode) || initialResponse.Headers.Location is null)
         {
             return current.ToString();
@@ -336,9 +350,15 @@ public sealed class PortalLoginClient
         for (var hop = 0; hop < 12; hop++)
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, current);
+            if (previous.Scheme is "http" or "https")
+            {
+                request.Headers.Referrer = previous;
+            }
+
             using var response = await client.SendAsync(request, cancellationToken);
             if (IsRedirect(response.StatusCode) && response.Headers.Location is not null)
             {
+                previous = current;
                 current = ToAbsoluteUri(current, response.Headers.Location);
                 trace.Add($"{tag}-redirect {(int)response.StatusCode} => {current}");
                 continue;
@@ -521,53 +541,545 @@ public sealed class PortalLoginClient
         }
     }
 
-    private static async Task ActivateTicketIfPresentAsync(
+    private static async Task<bool> ActivateTicketIfPresentAsync(
         HttpClient client,
+        UrlBundle urls,
         string finalAfterPost,
         int fallbackAcId,
         List<string> trace,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isWireless)
     {
         if (!Uri.TryCreate(finalAfterPost, UriKind.Absolute, out var finalUri))
         {
-            return;
+            return false;
         }
 
         if (!finalUri.AbsolutePath.Contains("srun_portal_sso", StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            return false;
         }
 
         var ticket = GetQueryValue(finalUri, "ticket");
         if (string.IsNullOrWhiteSpace(ticket))
         {
-            return;
+            return false;
         }
 
         var acIdRaw = GetQueryValue(finalUri, "ac_id");
-        var acId = int.TryParse(acIdRaw, out var parsedAcId) && parsedAcId > 0 ? parsedAcId : fallbackAcId;
+        var parsedAcId = int.TryParse(acIdRaw, out var parsed) && parsed > 0 ? parsed : 0;
+        var acId = parsedAcId > 0 ? parsedAcId : fallbackAcId;
+        var acIdCandidates = BuildAcIdCandidates(acId, fallbackAcId, 1);
 
-        var activateUrl = new UriBuilder(finalUri)
-        {
-            Path = "/v1/srun_portal_sso",
-            Query = $"ac_id={acId}&ticket={Uri.EscapeDataString(ticket)}"
-        }.Uri;
+        var activateCandidates = isWireless
+            ? BuildWirelessLegacyTicketActivateCandidates(finalUri, acId)
+            : BuildTicketActivateCandidates(finalUri, urls, acIdCandidates, ticket);
+        var activateOk = false;
+        Uri? activatedOn = null;
 
-        using var response = await client.GetAsync(activateUrl, cancellationToken);
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-        var bodySingleLine = ToSingleLine(body);
-        if (bodySingleLine.Length > 160)
+        for (var i = 0; i < activateCandidates.Count; i++)
         {
-            bodySingleLine = bodySingleLine[..160];
+            var activateUrl = activateCandidates[i];
+            using var request = new HttpRequestMessage(HttpMethod.Get, activateUrl);
+            if (finalUri.Scheme is "http" or "https")
+            {
+                request.Headers.Referrer = finalUri;
+            }
+            request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+
+            using var response = await client.SendAsync(request, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            var bodySingleLine = ToSingleLine(body);
+            if (bodySingleLine.Length > 180)
+            {
+                bodySingleLine = bodySingleLine[..180];
+            }
+
+            var ok = IsTicketActivateOk(body);
+            trace.Add($"ticket-activate[{i + 1}/{activateCandidates.Count}] status={(int)response.StatusCode} ok={ok} ac_ids={string.Join("/", acIdCandidates)} url={activateUrl} body={bodySingleLine}");
+
+            if (!isWireless && !ok && activateCandidates.Count < 16 && LooksLikeHtml(body))
+            {
+                var discovered = ExtractTicketActivateCandidatesFromHtml(activateUrl, body);
+                var added = 0;
+                foreach (var discoveredUrl in discovered)
+                {
+                    if (AddCandidate(activateCandidates, discoveredUrl))
+                    {
+                        added++;
+                    }
+                }
+
+                if (added > 0)
+                {
+                    trace.Add($"ticket-activate-discovered from={activateUrl} added={added}");
+                }
+            }
+
+            if (ok)
+            {
+                activateOk = true;
+                activatedOn = activateUrl;
+                break;
+            }
         }
-        trace.Add($"ticket-activate status={(int)response.StatusCode} url={activateUrl} body={bodySingleLine}");
 
-        var successUrl = new UriBuilder(finalUri)
+        var successBase = activatedOn ?? finalUri;
+        var successUrl = new UriBuilder(successBase)
         {
             Path = "/srun_portal_success",
             Query = $"ac_id={acId}&theme=pro"
         }.Uri;
-        await LoadPageAsync(client, successUrl, trace, "ticket-success-page", cancellationToken);
+        await LoadPageAsync(client, successUrl, trace, activateOk ? "ticket-success-page" : "ticket-success-page-fallback", cancellationToken);
+        return activateOk;
+    }
+
+    private static List<Uri> BuildWirelessLegacyTicketActivateCandidates(Uri finalUri, int acId)
+    {
+        var candidates = new List<Uri>();
+        var query = $"ac_id={acId}&ticket={Uri.EscapeDataString(GetQueryValue(finalUri, "ticket"))}";
+
+        AddCandidate(candidates, new UriBuilder(finalUri)
+        {
+            Path = "/v1/srun_portal_sso",
+            Query = query
+        }.Uri);
+
+        var alternateScheme = finalUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            ? Uri.UriSchemeHttp
+            : Uri.UriSchemeHttps;
+
+        AddCandidate(candidates, new UriBuilder(finalUri)
+        {
+            Scheme = alternateScheme,
+            Port = -1,
+            Path = "/v1/srun_portal_sso",
+            Query = query
+        }.Uri);
+
+        return candidates;
+    }
+
+    private static List<Uri> BuildTicketActivateCandidates(Uri finalUri, UrlBundle urls, List<int> acIdCandidates, string ticket)
+    {
+        var candidates = new List<Uri>();
+        var queries = BuildTicketQueries(acIdCandidates, ticket);
+
+        var baseAuthorities = new[]
+        {
+            new UriBuilder(finalUri) { Path = "/", Query = string.Empty }.Uri,
+            new UriBuilder(urls.PortalBase) { Path = "/", Query = string.Empty }.Uri
+        };
+
+        foreach (var authority in baseAuthorities)
+        {
+            var alternateScheme = authority.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                ? Uri.UriSchemeHttp
+                : Uri.UriSchemeHttps;
+
+            var schemes = new[] { authority.Scheme, alternateScheme };
+            foreach (var scheme in schemes)
+            {
+                foreach (var query in queries)
+                {
+                    AddCandidate(candidates, new UriBuilder(authority)
+                    {
+                        Scheme = scheme,
+                        Port = -1,
+                        Path = "/v1/srun_portal_sso",
+                        Query = query
+                    }.Uri);
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    private static async Task<bool> TryPortalConnectStepAsync(
+        HttpClient client,
+        UrlBundle urls,
+        int acId,
+        List<string> trace,
+        CancellationToken cancellationToken)
+    {
+        trace.Add("connect-step begin");
+
+        var pageCandidates = new List<Uri>
+        {
+            urls.PortalPageUrl,
+            new UriBuilder(urls.PortalHttpBase)
+            {
+                Path = "/srun_portal_pc",
+                Query = $"ac_id={acId}&theme=pro"
+            }.Uri,
+            new UriBuilder(urls.PortalBase)
+            {
+                Path = "/srun_portal_pc",
+                Query = "ac_id=1&theme=pro"
+            }.Uri,
+            new UriBuilder(urls.PortalHttpBase)
+            {
+                Path = "/srun_portal_pc",
+                Query = "ac_id=1&theme=pro"
+            }.Uri
+        };
+
+        for (var pageIndex = 0; pageIndex < pageCandidates.Count; pageIndex++)
+        {
+            var page = await LoadPageAsync(client, pageCandidates[pageIndex], trace, $"connect-page-{pageIndex + 1}", cancellationToken);
+            if (!Uri.TryCreate(page.FinalUrl, UriKind.Absolute, out var pageUri))
+            {
+                continue;
+            }
+
+            var pageAcIdRaw = GetQueryValue(pageUri, "ac_id");
+            var pageAcId = int.TryParse(pageAcIdRaw, out var parsedPageAcId) && parsedPageAcId > 0 ? parsedPageAcId : 0;
+            var actionAcIds = BuildAcIdCandidates(acId, pageAcId, 1);
+            trace.Add($"connect-page-acid page={pageUri} candidates={string.Join('/', actionAcIds)}");
+
+            var connectCandidates = BuildConnectActionCandidatesFromHtml(pageUri, page.Body, urls, actionAcIds);
+            if (connectCandidates.Count == 0)
+            {
+                trace.Add($"connect-step no action candidates from page {page.FinalUrl}");
+                continue;
+            }
+
+            for (var i = 0; i < connectCandidates.Count; i++)
+            {
+                var actionUrl = connectCandidates[i];
+                using var request = new HttpRequestMessage(HttpMethod.Get, actionUrl);
+                request.Headers.Referrer = pageUri;
+                request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+                using var response = await client.SendAsync(request, cancellationToken);
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                var bodySingleLine = ToSingleLine(body);
+                if (bodySingleLine.Length > 180)
+                {
+                    bodySingleLine = bodySingleLine[..180];
+                }
+
+                var ok = IsPortalConnectActionOk(body);
+                trace.Add($"connect-action[{i + 1}/{connectCandidates.Count}] status={(int)response.StatusCode} ok={ok} url={actionUrl} body={bodySingleLine}");
+
+                var redirect = ExtractRedirectFromPortalAction(body, actionUrl);
+                if (redirect is not null)
+                {
+                    var follow = await LoadPageAsync(client, redirect, trace, $"connect-follow-{i + 1}", cancellationToken);
+                    trace.Add($"connect-follow-{i + 1} final={follow.FinalUrl}");
+
+                    var activated = await ActivateTicketIfPresentAsync(client, urls, follow.FinalUrl, actionAcIds.FirstOrDefault(), trace, cancellationToken, isWireless: false);
+                    if (activated)
+                    {
+                        var redirectedVerify = await ProbeOnlineStateAsync(client, urls, trace, $"connect-follow-verify-{i + 1}", cancellationToken);
+                        if (redirectedVerify.Known && redirectedVerify.Online)
+                        {
+                            trace.Add("connect-step online confirmed after redirect follow");
+                            return true;
+                        }
+                    }
+                }
+
+                var verify = await ProbeOnlineStateAsync(client, urls, trace, $"connect-verify-{i + 1}", cancellationToken);
+                if (verify.Known && verify.Online)
+                {
+                    trace.Add("connect-step online confirmed");
+                    return true;
+                }
+            }
+        }
+
+        trace.Add("connect-step finished without online confirmation");
+        return false;
+    }
+
+    private static List<Uri> BuildConnectActionCandidatesFromHtml(Uri pageUri, string html, UrlBundle urls, List<int> acIdCandidates)
+    {
+        var results = new List<Uri>();
+        var decoded = WebUtility.HtmlDecode(html ?? string.Empty).Replace(@"\/", "/", StringComparison.Ordinal);
+
+        foreach (Match match in ConnectUrlRegex.Matches(decoded))
+        {
+            var raw = match.Groups["url"].Value.Trim();
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                continue;
+            }
+
+            if (raw.StartsWith("//", StringComparison.Ordinal))
+            {
+                raw = $"{pageUri.Scheme}:{raw}";
+            }
+
+            Uri? candidate = null;
+            if (Uri.TryCreate(raw, UriKind.Absolute, out var absolute))
+            {
+                candidate = absolute;
+            }
+            else if (Uri.TryCreate(pageUri, raw, out var relative))
+            {
+                candidate = relative;
+            }
+
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            candidate = NormalizeConnectActionUrl(candidate, acIdCandidates.FirstOrDefault());
+            if (candidate is not null)
+            {
+                AddCandidate(results, candidate);
+            }
+        }
+
+        foreach (var acId in acIdCandidates)
+        {
+            if (acId <= 0)
+            {
+                continue;
+            }
+
+            AddCandidate(results, new UriBuilder(urls.PortalHttpBase)
+            {
+                Path = "/v1/srun_portal_sso",
+                Query = $"ac_id={acId}&_={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+            }.Uri);
+            AddCandidate(results, new UriBuilder(urls.PortalBase)
+            {
+                Path = "/v1/srun_portal_sso",
+                Query = $"ac_id={acId}&_={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+            }.Uri);
+        }
+
+        return results;
+    }
+
+    private static Uri? NormalizeConnectActionUrl(Uri input, int acId)
+    {
+        if (!input.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+            !input.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (input.AbsolutePath.Contains("/cgi-bin/srun_portal", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!input.AbsolutePath.Contains("/v1/srun_portal_sso", StringComparison.OrdinalIgnoreCase) &&
+            !input.AbsolutePath.Contains("/srun_portal_sso", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var query = ParseQueryString(input.Query);
+
+        if (!query.ContainsKey("ac_id") && acId > 0)
+        {
+            query["ac_id"] = acId.ToString();
+        }
+
+        if (!query.ContainsKey("_"))
+        {
+            query["_"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        }
+
+        return new UriBuilder(input)
+        {
+            Query = BuildQueryString(query)
+        }.Uri;
+    }
+
+    private static bool IsPortalConnectActionOk(string responseText)
+    {
+        var jsonText = ExtractJsonPayload(responseText);
+        if (!string.IsNullOrWhiteSpace(jsonText))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(jsonText);
+                var root = doc.RootElement;
+                var codeText = GetPropertyString(root, "code");
+                if (int.TryParse(codeText, out var code) && code == 0)
+                {
+                    return true;
+                }
+
+                var error = FirstNonEmpty(
+                    GetPropertyString(root, "error"),
+                    GetPropertyString(root, "res"),
+                    GetPropertyString(root, "message"));
+                if (string.Equals(error, "ok", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(error, "success", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var text = responseText ?? string.Empty;
+        return text.Contains("success", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("ok", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Uri? ExtractRedirectFromPortalAction(string responseText, Uri baseUri)
+    {
+        var jsonText = ExtractJsonPayload(responseText);
+        if (string.IsNullOrWhiteSpace(jsonText))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(jsonText);
+            var root = doc.RootElement;
+            var redirect = FirstNonEmpty(
+                GetPropertyString(root, "Redirect"),
+                GetPropertyString(root, "redirect"),
+                GetPropertyString(root, "url"));
+            if (string.IsNullOrWhiteSpace(redirect))
+            {
+                return null;
+            }
+
+            if (Uri.TryCreate(redirect, UriKind.Absolute, out var absolute))
+            {
+                return absolute;
+            }
+
+            return Uri.TryCreate(baseUri, redirect, out var relative) ? relative : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool AddCandidate(List<Uri> list, Uri uri)
+    {
+        if (list.Any(x =>
+                string.Equals(x.Scheme, uri.Scheme, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(x.Host, uri.Host, StringComparison.OrdinalIgnoreCase) &&
+                x.Port == uri.Port &&
+                string.Equals(x.PathAndQuery, uri.PathAndQuery, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        list.Add(uri);
+        return true;
+    }
+
+    private static bool LooksLikeHtml(string body)
+    {
+        return !string.IsNullOrWhiteSpace(body) &&
+               body.Contains("<html", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<Uri> ExtractTicketActivateCandidatesFromHtml(Uri baseUri, string html)
+    {
+        var results = new List<Uri>();
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return results;
+        }
+
+        var decoded = WebUtility.HtmlDecode(html).Replace(@"\/", "/", StringComparison.Ordinal);
+        foreach (Match match in ActivateUrlRegex.Matches(decoded))
+        {
+            var raw = match.Groups["url"].Value.Trim();
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                continue;
+            }
+
+            if (raw.StartsWith("//", StringComparison.Ordinal))
+            {
+                raw = $"{baseUri.Scheme}:{raw}";
+            }
+
+            Uri? candidate = null;
+            if (Uri.TryCreate(raw, UriKind.Absolute, out var absolute))
+            {
+                candidate = absolute;
+            }
+            else if (Uri.TryCreate(baseUri, raw, out var relative))
+            {
+                candidate = relative;
+            }
+
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            if (!candidate.PathAndQuery.Contains("ticket=", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (AddCandidate(results, candidate) && candidate.Scheme is "http" or "https")
+            {
+                var alternateScheme = candidate.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                    ? Uri.UriSchemeHttp
+                    : Uri.UriSchemeHttps;
+                var alternate = new UriBuilder(candidate)
+                {
+                    Scheme = alternateScheme,
+                    Port = -1
+                }.Uri;
+                AddCandidate(results, alternate);
+            }
+        }
+
+        return results;
+    }
+
+    private static bool IsTicketActivateOk(string responseText)
+    {
+        var jsonText = ExtractJsonPayload(responseText);
+        if (string.IsNullOrWhiteSpace(jsonText))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(jsonText);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("code", out var codeElement))
+            {
+                if (codeElement.ValueKind == JsonValueKind.Number && codeElement.TryGetInt32(out var code) && code == 0)
+                {
+                    return true;
+                }
+
+                if (codeElement.ValueKind == JsonValueKind.String &&
+                    int.TryParse(codeElement.GetString(), out var codeString) &&
+                    codeString == 0)
+                {
+                    return true;
+                }
+            }
+
+            var message = FirstNonEmpty(
+                GetPropertyString(root, "message"),
+                GetPropertyString(root, "res"),
+                GetPropertyString(root, "error"));
+
+            return string.Equals(message, "success", StringComparison.OrdinalIgnoreCase)
+                   || string.Equals(message, "ok", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string ExtractLoginError(string html)
@@ -590,7 +1102,7 @@ public sealed class PortalLoginClient
         return Convert.ToBase64String(encrypted);
     }
 
-    private static UrlBundle BuildUrls(AppSettings settings)
+    private static UrlBundle BuildUrls(AppSettings settings, bool isWireless)
     {
         var portalBase = NormalizePortalHost(settings.PortalHost);
         var portalHttpBase = new UriBuilder(portalBase)
@@ -611,14 +1123,14 @@ public sealed class PortalLoginClient
             Query = $"ac_id={settings.AcId}&theme=pro"
         }.Uri;
 
-        var serviceUrl = BuildServiceUrl(settings, portalHttpBase);
+        var serviceUrl = BuildServiceUrl(settings, portalBase, isWireless);
         var tpassLoginUrl = new Uri("https://pass.neu.edu.cn/tpass/login?service=" + Uri.EscapeDataString(serviceUrl.ToString()));
         var tpassLogoutUrl = new Uri("https://pass.neu.edu.cn/tpass/logout?service=" + Uri.EscapeDataString(portalBase.ToString()));
 
         return new UrlBundle(portalBase, portalHttpBase, portalPageUrl, successPageUrl, serviceUrl, tpassLoginUrl, tpassLogoutUrl);
     }
 
-    private static Uri BuildServiceUrl(AppSettings settings, Uri portalHttpBase)
+    private static Uri BuildServiceUrl(AppSettings settings, Uri portalBase, bool isWireless)
     {
         Uri serviceUri;
         if (!string.IsNullOrWhiteSpace(settings.ServiceBaseUrl) &&
@@ -628,16 +1140,40 @@ public sealed class PortalLoginClient
         }
         else
         {
-            serviceUri = new Uri(portalHttpBase, "/srun_portal_sso");
+            serviceUri = new Uri(portalBase, "/srun_portal_sso");
         }
 
+        // Wireless keeps legacy HTTP service style. Wired prefers HTTPS.
         if (serviceUri.Host.Contains("ipgw.neu.edu.cn", StringComparison.OrdinalIgnoreCase) &&
+            isWireless &&
             serviceUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             serviceUri = new UriBuilder(serviceUri)
             {
                 Scheme = Uri.UriSchemeHttp,
                 Port = serviceUri.IsDefaultPort ? -1 : serviceUri.Port
+            }.Uri;
+        }
+
+        if (serviceUri.Host.Contains("ipgw.neu.edu.cn", StringComparison.OrdinalIgnoreCase) &&
+            !isWireless &&
+            serviceUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+        {
+            serviceUri = new UriBuilder(serviceUri)
+            {
+                Scheme = Uri.UriSchemeHttps,
+                Port = serviceUri.IsDefaultPort ? -1 : serviceUri.Port
+            }.Uri;
+        }
+
+        // If custom service points to the same host as portal host, align scheme with portal host.
+        if (string.Equals(serviceUri.Host, portalBase.Host, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(serviceUri.Scheme, portalBase.Scheme, StringComparison.OrdinalIgnoreCase))
+        {
+            serviceUri = new UriBuilder(serviceUri)
+            {
+                Scheme = portalBase.Scheme,
+                Port = portalBase.IsDefaultPort ? -1 : portalBase.Port
             }.Uri;
         }
 
@@ -802,6 +1338,81 @@ public sealed class PortalLoginClient
         }
 
         return string.Empty;
+    }
+
+    private static List<int> BuildAcIdCandidates(params int[] values)
+    {
+        var list = new List<int>();
+        foreach (var value in values)
+        {
+            if (value <= 0 || list.Contains(value))
+            {
+                continue;
+            }
+
+            list.Add(value);
+        }
+
+        return list;
+    }
+
+    private static List<string> BuildTicketQueries(List<int> acIdCandidates, string ticket)
+    {
+        var queries = new List<string>();
+        var encodedTicket = Uri.EscapeDataString(ticket);
+
+        queries.Add($"ticket={encodedTicket}");
+        foreach (var acId in acIdCandidates)
+        {
+            if (acId <= 0)
+            {
+                continue;
+            }
+
+            queries.Add($"ac_id={acId}&ticket={encodedTicket}");
+        }
+
+        return queries;
+    }
+
+    private static Dictionary<string, string> ParseQueryString(string query)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return map;
+        }
+
+        var trimmed = query.TrimStart('?');
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return map;
+        }
+
+        var parts = trimmed.Split('&', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var part in parts)
+        {
+            var index = part.IndexOf('=');
+            if (index <= 0)
+            {
+                continue;
+            }
+
+            var key = Uri.UnescapeDataString(part[..index]);
+            var value = Uri.UnescapeDataString(part[(index + 1)..]);
+            if (!string.IsNullOrWhiteSpace(key))
+            {
+                map[key] = value;
+            }
+        }
+
+        return map;
+    }
+
+    private static string BuildQueryString(Dictionary<string, string> query)
+    {
+        return string.Join("&", query.Select(kv =>
+            $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value ?? string.Empty)}"));
     }
 
     private static string BuildCallback()

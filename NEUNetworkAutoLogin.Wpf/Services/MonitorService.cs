@@ -34,24 +34,50 @@ public sealed class MonitorService
 
     public bool IsRunning => _runTask is { IsCompleted: false };
 
-    public async Task StartAsync(CancellationToken externalToken = default)
+    public bool IsRunningInAnotherProcess
+    {
+        get
+        {
+            CleanupCompletedRunBestEffort();
+            return !IsRunning && IsMutexHeldByAnotherProcess();
+        }
+    }
+
+    public enum StartResult
+    {
+        Started,
+        AlreadyRunningLocally,
+        AlreadyRunningInAnotherProcess,
+        DisabledBySettings
+    }
+
+    public async Task<StartResult> StartAsync(CancellationToken externalToken = default)
     {
         await _lifecycleLock.WaitAsync(externalToken);
         try
         {
+            CleanupCompletedRunUnsafe();
+
             if (IsRunning)
             {
-                return;
+                return StartResult.AlreadyRunningLocally;
+            }
+
+            var settings = _settingsStore.Load();
+            if (!settings.EnableBackgroundMonitor)
+            {
+                _logger.Log("Monitor start skipped because background monitor is disabled in settings.");
+                return StartResult.DisabledBySettings;
             }
 
             if (!TryAcquireMutex())
             {
-                _logger.Log("Another monitor instance is already running.");
-                return;
+                return StartResult.AlreadyRunningInAnotherProcess;
             }
 
             _runCts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
             _runTask = Task.Run(() => RunLoopAsync(_runCts.Token), CancellationToken.None);
+            return StartResult.Started;
         }
         finally
         {
@@ -64,6 +90,8 @@ public sealed class MonitorService
         await _lifecycleLock.WaitAsync();
         try
         {
+            CleanupCompletedRunUnsafe();
+
             if (_runCts is null || _runTask is null)
             {
                 ReleaseMutex();
@@ -92,15 +120,89 @@ public sealed class MonitorService
         }
     }
 
-    private bool TryAcquireMutex()
+    private void CleanupCompletedRunBestEffort()
     {
-        _mutex = new Mutex(false, MutexName);
+        if (!_lifecycleLock.Wait(0))
+        {
+            return;
+        }
+
         try
         {
-            return _mutex.WaitOne(0, false);
+            CleanupCompletedRunUnsafe();
+        }
+        finally
+        {
+            _lifecycleLock.Release();
+        }
+    }
+
+    private void CleanupCompletedRunUnsafe()
+    {
+        if (_runTask is { IsCompleted: true })
+        {
+            try
+            {
+                _runTask.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                // monitor loop exception has been logged already.
+            }
+
+            _runTask = null;
+            _runCts?.Dispose();
+            _runCts = null;
+            ReleaseMutex();
+        }
+    }
+
+    private bool IsMutexHeldByAnotherProcess()
+    {
+        using var probeMutex = new Mutex(false, MutexName);
+        try
+        {
+            var acquired = probeMutex.WaitOne(0, false);
+            if (acquired)
+            {
+                probeMutex.ReleaseMutex();
+                return false;
+            }
+
+            return true;
         }
         catch (AbandonedMutexException)
         {
+            try
+            {
+                probeMutex.ReleaseMutex();
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+    }
+
+    private bool TryAcquireMutex()
+    {
+        var mutex = new Mutex(false, MutexName);
+        try
+        {
+            var acquired = mutex.WaitOne(0, false);
+            if (!acquired)
+            {
+                mutex.Dispose();
+                return false;
+            }
+
+            _mutex = mutex;
+            return true;
+        }
+        catch (AbandonedMutexException)
+        {
+            _mutex = mutex;
             return true;
         }
     }
@@ -130,58 +232,100 @@ public sealed class MonitorService
     {
         _logger.Log("Autologin monitor started.");
 
-        var settings = _settingsStore.Load();
-        await Task.Delay(TimeSpan.FromSeconds(settings.InitialDelaySeconds), cancellationToken);
-
-        var lastHealthState = (bool?)null;
-        var nextLoginAllowedAt = DateTimeOffset.Now;
-
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            settings = _settingsStore.Load();
-            var healthy = await _probeService.IsHealthyAsync(settings, cancellationToken);
-
-            if (lastHealthState != healthy)
+            var settings = _settingsStore.Load();
+            if (!settings.EnableBackgroundMonitor)
             {
-                _logger.Log(healthy
-                    ? "Network health check: online."
-                    : "Network health check: offline or captive portal detected.");
-                lastHealthState = healthy;
+                _logger.Log("Background monitor is disabled. Monitor loop exited.");
+                return;
             }
 
-            if (!healthy)
-            {
-                if (DateTimeOffset.Now >= nextLoginAllowedAt)
-                {
-                    var portalContext = await _probeService.ResolvePortalContextAsync(settings, cancellationToken);
-                    _logger.Log($"Selected login context: ac_id={portalContext.AcId}, portal={portalContext.PortalHost}");
+            await Task.Delay(TimeSpan.FromSeconds(settings.InitialDelaySeconds), cancellationToken);
 
-                    var credential = _credentialStore.Load();
-                    if (string.IsNullOrWhiteSpace(credential.Username) || string.IsNullOrWhiteSpace(credential.Password))
+            var lastHealthState = (bool?)null;
+            var nextLoginAllowedAt = DateTimeOffset.Now;
+            var cooldownNoticeLogged = false;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    settings = _settingsStore.Load();
+                    if (!settings.EnableBackgroundMonitor)
                     {
-                        _logger.Log("Credential is empty. Skip login.");
+                        _logger.Log("Background monitor option turned off. Monitor loop stopped.");
+                        break;
+                    }
+
+                    var healthy = await _probeService.IsHealthyAsync(settings, cancellationToken);
+
+                    if (lastHealthState != healthy)
+                    {
+                        _logger.Log(healthy
+                            ? "Network health check: online."
+                            : "Network health check: offline or captive portal detected.");
+                        lastHealthState = healthy;
+                    }
+
+                    if (!healthy)
+                    {
+                        if (DateTimeOffset.Now >= nextLoginAllowedAt)
+                        {
+                            cooldownNoticeLogged = false;
+                            var portalContext = await _probeService.ResolvePortalContextAsync(settings, cancellationToken);
+                            _logger.Log($"Selected login context: ac_id={portalContext.AcId}, portal={portalContext.PortalHost}");
+
+                            var credential = _credentialStore.Load();
+                            if (string.IsNullOrWhiteSpace(credential.Username) || string.IsNullOrWhiteSpace(credential.Password))
+                            {
+                                _logger.Log("Credential is empty. Skip login.");
+                            }
+                            else
+                            {
+                                var success = await TryLoginBurstAsync(settings, portalContext, credential, cancellationToken);
+                                if (success)
+                                {
+                                    lastHealthState = null;
+                                }
+                                else
+                                {
+                                    nextLoginAllowedAt = DateTimeOffset.Now.AddMinutes(settings.FailureCooldownMinutes);
+                                    _logger.Log($"Entering cooldown until {nextLoginAllowedAt:yyyy-MM-dd HH:mm:ss}.");
+                                    cooldownNoticeLogged = true;
+                                }
+                            }
+                        }
+                        else if (!cooldownNoticeLogged)
+                        {
+                            _logger.Log($"Cooldown active; skipping login until {nextLoginAllowedAt:yyyy-MM-dd HH:mm:ss}.");
+                            cooldownNoticeLogged = true;
+                        }
                     }
                     else
                     {
-                        var success = await TryLoginBurstAsync(settings, portalContext, credential, cancellationToken);
-                        if (success)
-                        {
-                            lastHealthState = null;
-                        }
-                        else
-                        {
-                            nextLoginAllowedAt = DateTimeOffset.Now.AddMinutes(settings.FailureCooldownMinutes);
-                            _logger.Log($"Entering cooldown until {nextLoginAllowedAt:yyyy-MM-dd HH:mm:ss}.");
-                        }
+                        cooldownNoticeLogged = false;
                     }
+
+                    await Task.Delay(TimeSpan.FromSeconds(settings.MonitorIntervalSeconds), cancellationToken);
                 }
-                else
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    _logger.Log($"Cooldown active; skipping login until {nextLoginAllowedAt:yyyy-MM-dd HH:mm:ss}.");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Log($"Monitor loop error: {ex.Message}");
+                    await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
                 }
             }
-
-            await Task.Delay(TimeSpan.FromSeconds(settings.MonitorIntervalSeconds), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _logger.Log("Autologin monitor stopped.");
         }
     }
 
@@ -194,7 +338,7 @@ public sealed class MonitorService
         var effective = new AppSettings
         {
             AcId = context.AcId > 0 ? context.AcId : settings.AcId,
-            PortalHost = string.IsNullOrWhiteSpace(settings.PortalHost) ? context.PortalHost : settings.PortalHost,
+            PortalHost = string.IsNullOrWhiteSpace(context.PortalHost) ? settings.PortalHost : context.PortalHost,
             ServiceBaseUrl = settings.ServiceBaseUrl,
             InitialDelaySeconds = settings.InitialDelaySeconds,
             RetryDelaySeconds = settings.RetryDelaySeconds,
@@ -207,7 +351,7 @@ public sealed class MonitorService
         for (var attempt = 1; attempt <= settings.MaxAttempts; attempt++)
         {
             _logger.Log($"Login attempt {attempt}/{settings.MaxAttempts} (ac_id={effective.AcId}).");
-            var result = await _portalLoginClient.LoginAsync(effective, credential, cancellationToken);
+            var result = await _portalLoginClient.LoginAsync(effective, credential, cancellationToken, context.IsWireless);
             _logger.Log($"login => success={result.Success}, finalUrl={result.FinalUrl}, message={result.Message}");
             if (result.Trace.Count > 0)
             {
